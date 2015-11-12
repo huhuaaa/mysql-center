@@ -14,13 +14,22 @@ struct mysql_connect_struct
 };
 
 /**
- * 获取一个mysql写结构
+ * 获取一个mysql写服务器信息结构
  * @return [description]
  */
 struct mysql_connect_struct mysql_write_struct(){
     struct mysql_connect_struct mysql = {"127.0.0.1", 3306};
     return mysql;
 }
+
+/**
+ * 获取一个mysql读服务器信息结构
+ * @return [description]
+ */
+struct mysql_connect_struct mysql_read_struct(){
+    struct mysql_connect_struct mysql = {"192.168.1.135", 3306};
+    return mysql;
+};
 
 /**
  * 创建一个mysql连接客户端
@@ -61,16 +70,43 @@ int mysql_client(struct mysql_connect_struct mysql){
  */
 char* parse_mysql(char buf[], int bufLen){
 
-    if(bufLen > 3){
-        printf("%d\n", buf[0]);
-        printf("%d\n", buf[1]);
-        printf("%d\n", buf[2]);
-        int len = (buf[0] * 65536) + (buf[1] * 16 * 16) + buf[2];
-        //printf("message len : %d\n", len);
+    if(bufLen > 4){
+        size_t len = buf[0] + buf[1] * 10 + buf[2] * 100;
+        printf("message len : %d\n", len);
+        printf("message number : %d\n", buf[3]);
+        printf("commend id : %d\n", buf[4]);
+        char *commend = malloc(len);
+        memset(commend, 0, len);
+        memcpy(commend, buf + 5, len - 1);
+        //memcpy(commend + len - 1, "\0", 1);
+        printf("commend : %s\n", commend);
+        free(commend);
         return "";
     }else{
         return "";
     }
+}
+//接受客户端，一次接收完成，大于16M的命令不管
+size_t mysql_client_recv(int fd, char **buffer){
+    char *header;
+    char *body;
+    size_t bodyLen;
+    size_t len = 0;
+    int ret = socket_recv(fd, &header, 4);
+    if(ret > 0){
+        bodyLen = header[0] + header[1] * 10 + header[2] * 100;
+        printf("number : %d\n", header[3]);
+        ret = socket_recv(fd, &body, bodyLen);
+        if(ret > 0){
+            *buffer = malloc(bodyLen + 4);
+            memcpy(*buffer, header, 4);
+            memcpy(*buffer + 4, body, bodyLen);
+            len = ret + 4;
+            free(body);
+        }
+        free(header);
+    }
+    return len;
 }
 
 /**
@@ -84,7 +120,6 @@ int main(int argc, char *argv[])
     int server_sockfd;//服务器端套接字
     struct client_info client;
     int pid;//process id
-    unsigned char buf[BUFFSIZE];  //数据传送的缓冲区
 
     server_sockfd = socket_server(8000);
       
@@ -108,60 +143,95 @@ int main(int argc, char *argv[])
         //print client ip addr
         printf("accept client %s\n", client.ip);
 
-        //write tcp client
+        //write mysql struct
         struct mysql_connect_struct write = mysql_write_struct();
+        //read mysql struct
+        struct mysql_connect_struct read = mysql_read_struct();
 
         int writeClientfd = mysql_client(write);
-        char *buffer = NULL;
-        size_t len;
-        while((len = socket_recv(writeClientfd, &buffer, BUFFSIZE)) > 0){
+        int readClientfd = mysql_client(read);
+        int select_fd = readClientfd;
+        select_fd = writeClientfd > select_fd ? writeClientfd : select_fd;
+        select_fd = client.fd > select_fd ? client.fd : select_fd;
 
-            if(buffer == NULL){
-                printf("wait mysqld response\n");
-                continue;
-            }
+        char *buffer = NULL;//数据传送的缓冲区
+        size_t len;//用于存取buffer的长度
 
-            printf("mysqld response : %s\n", buffer);
-            printf("mysqld response len: %d\n", len);
+        //超时设置
+        struct timeval timeout = {0, 0};
+        fd_set fds;
+        int ret;
 
-            char* sql = parse_mysql(buffer, len);
+        //非阻塞方式
+        while(1){
+            FD_ZERO(&fds); //每次循环都要清空集合，否则不能检测描述符变化
+            FD_SET(client.fd, &fds); //添加描述符
+            FD_SET(writeClientfd, &fds);
+            FD_SET(readClientfd, &fds);
 
-            socket_send(client.fd, buffer, len, BUFFSIZE);
+            ret = select(select_fd + 1, &fds, NULL, NULL, &timeout);
+            if(ret < 0){
+                perror("select");
+            }else if(ret > 0){
+                if(FD_ISSET(readClientfd, &fds)){
+                    //这种方法一次读取的数据太少，那么增加了读写次数效率降低
+                    //len = mysql_client_recv(writeClientfd, &buffer);
+                    //采用读取固定最大字节，如果没有达到那么缓冲区内有多少取多少
+                    len = socket_recv(readClientfd, &buffer, BUFFSIZE);
+                    if(len > 0){
+                        //printf("mysqld response : %s\n", buffer);
+                        //printf("mysqld response len: %d\n", len);
 
-            printf("send to client success\n");
+                        socket_send(client.fd, buffer, len, BUFFSIZE);
 
-            //free malloc
-            free(buffer);
-            buffer = NULL;
-            len = 0;
+                        //printf("send to client success\n");
 
-            while((len = socket_recv(client.fd, &buffer, BUFFSIZE)) > 0){
-
-                if(buffer == NULL){
-                    printf("wait client response\n");
-                    continue;
+                        //free malloc
+                        free(buffer);
+                        buffer = NULL;
+                        len = 0;
+                    }
                 }
 
-                printf("client response : %s\n", buffer);
-                printf("client response len: %d\n", len);
+                if(FD_ISSET(writeClientfd, &fds)){
+                    len = socket_recv(writeClientfd, &buffer, BUFFSIZE);
+                    if(len > 0){
+                        //printf("mysqld response : %s\n", buffer);
+                        //printf("mysqld response len: %d\n", len);
 
-                sql = parse_mysql(buffer, len);
+                        socket_send(client.fd, buffer, len, BUFFSIZE);
 
-                send(writeClientfd, buffer, len, BUFFSIZE);
+                        //printf("send to client success\n");
 
-                printf("send to mysqld success\n");
+                        //free malloc
+                        free(buffer);
+                        buffer = NULL;
+                        len = 0;
+                    }
+                }
 
-                //free malloc
-                free(buffer);
-                buffer = NULL;
-                len = 0;
+                if(FD_ISSET(client.fd, &fds)){
+                    len = mysql_client_recv(client.fd, &buffer);
+                    if(len > 0){
+                        //printf("client response : %s\n", buffer);
+                        //printf("client response len: %d\n", len);
 
-                break;
+                        char *sql = parse_mysql(buffer, len);
+
+                        send(readClientfd, buffer, len, BUFFSIZE);
+
+                        //printf("send to mysqld success\n");
+
+                        //free malloc
+                        free(buffer);
+                        buffer = NULL;
+                        len = 0;
+                    }
+                }
+            }else{
+                //printf("mysqld timeout\n");
             }
         }
-        printf("client close %s\n", client.ip);
-        close(writeClientfd);
-        break;
     }  
     close(client.fd);  
     close(server_sockfd);  
